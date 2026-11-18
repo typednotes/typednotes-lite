@@ -59,12 +59,12 @@ python3 -m unittest discover -s lite/tests -v   # needs a typednotes-infra check
 
 ## Required setup
 
-- **`INFRA_TOKEN` repository secret**: a fine-grained token with Contents read
-  permission for the private `typednotes/typednotes-infra` repository, used by
-  the verify job's fleet-declaration checkout.
 - **GHCR package access**: the `ghcr.io/typednotes/typednotes-lite` and
   `typednotes-local` packages were created by typednotes-infra. Grant this
   repository write access to them in each package's *Manage Actions access*
   settings (or the first publish will fail).
 - Both packages must stay **public** for anonymous pulls by users, Scaleway and
   typednotes-infra's live-plan registry reads.
+- An `INFRA_TOKEN` repository secret is only needed if the (currently public)
+  [typednotes-infra](https://github.com/typednotes/typednotes-infra) repository
+  is private again.

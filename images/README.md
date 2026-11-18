@@ -84,7 +84,7 @@ merely causes another build; image digests are always read from the registry.
 ## Fleet verification
 
 The fleet declaration, Lean project, service configuration scripts and policy
-snapshot are owned by the private
+snapshot are owned by the
 [typednotes-infra repository](https://github.com/typednotes/typednotes-infra).
 Before publishing, the workflow's verify job checks it out at `infra_ref`
 (default `main`, overridable on manual runs), overlays this revision's
@@ -92,12 +92,13 @@ Before publishing, the workflow's verify job checks it out at `infra_ref`
 checks plus the test suites against that declaration — so a published image is
 always verified against the live fleet.
 
-Because typednotes-infra is private, the checkout needs an `INFRA_TOKEN`
-repository secret: a fine-grained token with Contents read permission for
-`typednotes/typednotes-infra` (or remove the secret and make that repository
-public). The check compares `images/vault-identities.json` here against the
-declaration exported by infra's `scripts/lite-config.lean`; when infra changes
-vault policies, regenerate and commit the snapshot from an infra checkout:
+typednotes-infra is public, so the default `github.token` can check it out; an
+`INFRA_TOKEN` repository secret (fine-grained token with Contents read
+permission for `typednotes/typednotes-infra`) is only needed if that repository
+is private again. The check compares `images/vault-identities.json` here against
+the declaration exported by infra's `scripts/lite-config.lean`; when infra
+changes vault policies, regenerate and commit the snapshot from an infra
+checkout:
 
 ```sh
 lake env lean --run scripts/lite-config.lean | jq '{vaultIdentities}' > images/vault-identities.json
