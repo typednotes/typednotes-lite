@@ -1,0 +1,404 @@
+name: Combined images
+
+on:
+  push:
+    branches: [main]
+    paths: ['images/**', 'local/**', 'lite/**', 'scripts/**', '.dockerignore', '.github/workflows/images.yml']
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  repository_dispatch:
+    types: [service-version-updated]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if these service versions were already published
+        type: boolean
+        default: false
+      infra_ref:
+        description: typednotes-infra revision whose fleet declaration is verified
+        type: string
+        default: main
+  workflow_call:
+    inputs:
+      force:
+        type: boolean
+        default: false
+      infra_ref:
+        type: string
+        default: main
+    outputs:
+      lite:
+        description: Published Lite image pinned by digest
+        value: ${{ jobs.publish.outputs.lite }}
+      local:
+        description: Published Local image pinned by digest
+        value: ${{ jobs.publish.outputs.local }}
+
+permissions:
+  contents: read
+  packages: write
+
+# Both architectures and variants are promoted together after their smoke tests.
+# Source-version notifications only wake the resolver: no payload becomes code,
+# a repository URL, a build ref, or a shell command.
+concurrency:
+  # Reusable calls inherit the caller's workflow name. Keep a manual caller out
+  # of the scheduled publisher's one-pending-run slot, which cron can replace.
+  group: combined-images-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.decision.outputs.changed }}
+      key: ${{ steps.refs.outputs.key }}
+      build_id: ${{ steps.decision.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find newest stable tags of all six services
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m images.releases --refs-only --output .images --revision "$GITHUB_SHA"
+          echo "key=$(jq -r .key .images/refs.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            .images/refs.json
+            .images/manifest.json
+            .images/bake.json
+            .images/migrations
+          key: combined-images-${{ steps.refs.outputs.key }}
+      - name: Resolve matching SQL only when a rebuild is needed
+        id: decision
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          changed=false
+          if [ "$CACHE_HIT" != true ] || [ "$FORCE" = true ]; then
+            python3 -m images.releases --output .images --refs-file .images/refs.json --revision "$GITHUB_SHA"
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "build_id=$(jq -r .build_id .images/manifest.json)" >> "$GITHUB_OUTPUT"
+          jq -r '.sources | to_entries[] | "* \(.key): \(.value.tag) @ \(.value.commit)"' .images/manifest.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: combined-source-bundle
+          path: .images/
+          include-hidden-files: true
+          retention-days: 7
+          overwrite: true
+
+  verify:
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      # The fleet declaration, Lean project, service configuration scripts and
+      # policy snapshot are owned by typednotes-infra. Check it out as the
+      # workspace root so lean-action and lake run against a real project; the
+      # packaging revision under test overlays this checkout below, so the
+      # published image is verified against the live fleet declaration.
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: typednotes/typednotes-infra
+          ref: ${{ inputs.infra_ref || 'main' }}
+          token: ${{ secrets.INFRA_TOKEN || github.token }}
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: build
+          persist-credentials: false
+      - name: Install native FFI dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libssl-dev libsecret-1-dev pkg-config ca-certificates
+      - uses: leanprover/lean-action@v1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: combined-source-bundle
+          path: .images
+      - name: Overlay this revision's packaging over the infra checkout
+        run: |
+          cp -r build/images/. images/
+          cp -r build/lite/. lite/
+          cp -r build/local/. local/
+      - name: Verify all layouts, policy correspondence and bootstrap tests
+        run: |
+          TYPEDNOTES_DEPLOYMENT=lite lake exe typednotes-infra check
+          TYPEDNOTES_DEPLOYMENT=full lake exe typednotes-infra check
+          TYPEDNOTES_DEPLOYMENT=full-from-lite lake exe typednotes-infra check
+          TYPEDNOTES_DEPLOYMENT=lite-storage lake exe typednotes-infra check
+          lake env lean --run scripts/check-topology.lean
+          python3 -m unittest discover -s lite/tests -v
+          python3 -m unittest discover -s images/tests -v
+          python3 -m unittest discover -s local/tests -v
+          bash build/scripts/prepare-image-runner.sh --dry-run
+          lake env lean --run scripts/lite-config.lean > "$RUNNER_TEMP/lite-config.json"
+          jq -e --slurpfile actual "$RUNNER_TEMP/lite-config.json" '.vaultIdentities == $actual[0].vaultIdentities' images/vault-identities.json
+          lake env lean --run scripts/service-config.lean docker .images/manifest.json > "$RUNNER_TEMP/service-config.json"
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-config
+          path: ${{ runner.temp }}/service-config.json
+          retention-days: 7
+          overwrite: true
+
+  services:
+    needs: [resolve, verify]
+    if: needs.resolve.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        service: [app, ledger, liaison, vault, lode, lun]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      PLATFORM: linux/${{ matrix.arch }}
+      SERVICE: ${{ matrix.service }}
+      BUILD_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+      ARTIFACT_IMAGE: ghcr.io/typednotes/typednotes-lite:source-${{ matrix.service }}-${{ needs.resolve.outputs.build_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: combined-source-bundle
+          path: .images
+      - name: Reclaim unused hosted-runner SDK space
+        run: bash scripts/prepare-image-runner.sh
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+      - name: Build one service and publish only its flattened assembly inputs
+        id: artifact
+        uses: docker/bake-action@v7
+        with:
+          source: .
+          files: |
+            lite/docker-bake.hcl
+            .images/bake.json
+          targets: ${{ matrix.service }}-artifact
+          pull: ${{ inputs.force || false }}
+          no-cache: ${{ inputs.force || false }}
+          set: |
+            ${{ matrix.service }}-artifact.output=type=registry
+            ${{ matrix.service }}-artifact.tags=${{ env.ARTIFACT_IMAGE }}
+            ${{ matrix.service }}-artifact.labels.org.opencontainers.image.source=https://github.com/typednotes/typednotes-lite
+            ${{ matrix.service }}-artifact.labels.io.typednotes.service=${{ matrix.service }}
+      - name: Record the artifact's immutable digest and source identity
+        env:
+          BUILD_METADATA: ${{ steps.artifact.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          digest=$(jq -er --arg target "$SERVICE-artifact" '.[$target]["containerimage.digest"]' <<< "$BUILD_METADATA")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -n --arg service "$SERVICE" --arg platform "$PLATFORM" --arg build_run "$BUILD_RUN" \
+            --arg image "ghcr.io/typednotes/typednotes-lite@$digest" --slurpfile bundle .images/manifest.json \
+            '{service:$service, platform:$platform, build_run:$build_run, image:$image,
+              build_id:$bundle[0].build_id, commit:$bundle[0].sources[$service].commit}' \
+            > ".images/service-$SERVICE.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-${{ matrix.service }}-${{ matrix.arch }}
+          path: .images/service-${{ matrix.service }}.json
+          include-hidden-files: true
+          retention-days: 7
+          overwrite: true
+
+  assemble:
+    needs: [resolve, services]
+    if: needs.resolve.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      PLATFORM: linux/${{ matrix.arch }}
+      ARCH: ${{ matrix.arch }}
+      BUILD_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+      LITE_IMAGE: ghcr.io/typednotes/typednotes-lite:build-${{ needs.resolve.outputs.build_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+      LOCAL_IMAGE: ghcr.io/typednotes/typednotes-local:build-${{ needs.resolve.outputs.build_id }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reclaim unused hosted-runner SDK space
+        run: bash scripts/prepare-image-runner.sh
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: combined-source-bundle
+          path: .images
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: service-*-${{ matrix.arch }}
+          merge-multiple: true
+          path: .images/service-images
+      - uses: actions/download-artifact@v4
+        with:
+          name: service-config
+          path: .images
+      - name: Validate artifact identities and isolate the assembly graph
+        run: |
+          python3 -m images.assembly .images/manifest.json .images/service-images \
+            --platform "$PLATFORM" --build-run "$BUILD_RUN"
+          docker buildx bake -f lite/docker-bake.hcl -f .images/bake.json -f .images/assembly.json --print > "$RUNNER_TEMP/bake.json"
+          python3 lite/check-build.py .images/manifest.json "$RUNNER_TEMP/bake.json" \
+            --receipts .images/service-images --build-run "$BUILD_RUN"
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+      - name: Assemble both variants from digest-pinned service artifacts
+        uses: docker/bake-action@v7
+        with:
+          source: .
+          files: |
+            lite/docker-bake.hcl
+            .images/bake.json
+            .images/assembly.json
+          targets: lite,local
+          pull: ${{ inputs.force || false }}
+          no-cache: ${{ inputs.force || false }}
+          set: |
+            lite.output=type=docker
+            local.output=type=docker
+      - name: Smoke test split Lite storage and full promotion
+        run: python3 lite/check-image.py "$LITE_IMAGE" .images/manifest.json
+      - name: Smoke test self-contained Local and container recreation
+        run: python3 local/check-image.py "$LOCAL_IMAGE"
+      - name: Publish tested native-architecture images
+        run: |
+          set -euo pipefail
+          docker push "$LITE_IMAGE"
+          docker push "$LOCAL_IMAGE"
+          lite=$(docker image inspect "$LITE_IMAGE" | jq -er '.[0].RepoDigests[] | select(startswith("ghcr.io/typednotes/typednotes-lite@sha256:"))')
+          local_image=$(docker image inspect "$LOCAL_IMAGE" | jq -er '.[0].RepoDigests[] | select(startswith("ghcr.io/typednotes/typednotes-local@sha256:"))')
+          jq -n --arg platform "$PLATFORM" --arg build_run "$BUILD_RUN" --arg lite "$lite" --arg local_image "$local_image" \
+            --slurpfile bundle .images/manifest.json \
+            '{platform:$platform, build_run:$build_run, build_id:$bundle[0].build_id, images:{lite:$lite, local:$local_image}}' \
+            > ".images/variant-$ARCH.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: variant-images-${{ matrix.arch }}
+          path: .images/variant-${{ matrix.arch }}.json
+          include-hidden-files: true
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    needs: [resolve, assemble]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.resolve.outputs.changed == 'false' || needs.assemble.result == 'success') }}
+    runs-on: ubuntu-latest
+    outputs:
+      lite: ${{ steps.images.outputs.lite }}
+      local: ${{ steps.images.outputs.local }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: combined-source-bundle
+          path: .images
+      - uses: actions/download-artifact@v4
+        if: needs.resolve.outputs.changed == 'true'
+        with:
+          pattern: variant-images-*
+          merge-multiple: true
+          path: .images/variant-images
+      - name: Validate both tested architectures before promotion
+        if: needs.resolve.outputs.changed == 'true'
+        env:
+          BUILD_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 -m images.assembly .images/manifest.json .images/variant-images \
+            --variants --build-run "$BUILD_RUN" --output .images/publish-inputs.json
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote both tested architectures and return exact digests
+        id: images
+        env:
+          BUILD_ID: ${{ needs.resolve.outputs.build_id }}
+          BUILD_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+          CHANGED: ${{ needs.resolve.outputs.changed }}
+          PROMOTE_LATEST: ${{ github.workflow == 'Combined images' }}
+        run: |
+          set -euo pipefail
+          for variant in lite local; do
+            image="ghcr.io/typednotes/typednotes-$variant"
+            if [ "$CHANGED" = true ]; then
+              unique="$image:build-$BUILD_ID-$BUILD_RUN"
+              amd64=$(jq -er --arg variant "$variant" '.[$variant][0]' .images/publish-inputs.json)
+              arm64=$(jq -er --arg variant "$variant" '.[$variant][1]' .images/publish-inputs.json)
+              docker buildx imagetools create --tag "$unique" \
+                "$amd64" "$arm64"
+              digest=$(docker buildx imagetools inspect "$unique" --format '{{.Manifest.Digest}}')
+              tags=(--tag "$image:build-$BUILD_ID")
+              # Only standalone runs of this publisher advance latest. Reusable
+              # callers consume their own run-specific immutable digest.
+              if [ "$PROMOTE_LATEST" = true ]; then tags+=(--tag "$image:latest"); fi
+              docker buildx imagetools create "${tags[@]}" "$image@$digest"
+            else
+              digest=$(docker buildx imagetools inspect "$image:build-$BUILD_ID" --format '{{.Manifest.Digest}}')
+              if [ "$PROMOTE_LATEST" = true ]; then
+                docker buildx imagetools create --tag "$image:latest" "$image@$digest"
+              fi
+            fi
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            echo "$variant=$image@$digest" >> "$GITHUB_OUTPUT"
+            echo "* $variant: $image@$digest" >> "$GITHUB_STEP_SUMMARY"
+          done
+      # This is a rebuild cache, not deployment state. Losing/evicting it just
+      # repeats a build; successful image digests always come from the registry.
+      - uses: actions/cache/save@v4
+        if: needs.resolve.outputs.changed == 'true'
+        with:
+          path: |
+            .images/refs.json
+            .images/manifest.json
+            .images/bake.json
+            .images/migrations
+          key: combined-images-${{ needs.resolve.outputs.key }}

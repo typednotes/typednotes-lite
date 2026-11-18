@@ -1,0 +1,13 @@
+*
+!lite/
+!lite/Dockerfile
+!lite/runtime.py
+!images/
+!images/*.py
+!images/artifact.Dockerfile
+!local/
+!local/*.py
+!.images/
+!.images/manifest.json
+!.images/migrations/
+!.images/migrations/**
