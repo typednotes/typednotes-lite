@@ -216,6 +216,8 @@ class DeploymentSecretTests(unittest.TestCase):
                     "DROPBOX_CLIENT_ID", "DROPBOX_CLIENT_SECRET", "SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET",
                     "SLACK_SIGNING_SECRET", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN"):
             env[key] = "x" * 32
+        if mode in ("full", "full-from-lite"):
+            env["OPERATOR_CIDRS"] = "192.0.2.1/32"
         env.update(extra)
         return subprocess.run(["bash", str(ROOT.parent / "scripts/check-deployment-secrets.sh")],
                               env=env, capture_output=True, text=True, check=False)
