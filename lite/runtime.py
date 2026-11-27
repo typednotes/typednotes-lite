@@ -130,8 +130,11 @@ def services(source, *, state_root=None, allow_compute=False, standalone=None):
             env[name.upper() + "_WORKDIR"] = home + "/work"
             env[name.upper() + "_PACKAGE_CACHE"] = f"/opt/{name}/cache"
         if name == "lode":
-            env.update(LODE_LINEN_REV=source.get("LODE_LINEN_REF", "v1.12.0"),
-                       LODE_TOOLCHAIN=source.get("LODE_TOOLCHAIN", "leanprover/lean4:v4.34.0"))
+            # The bundle sets these from the worker lockfile. Otherwise use Lode’s defaults.
+            if "LODE_LINEN_REF" in source:
+                env["LODE_LINEN_REV"] = source["LODE_LINEN_REF"]
+            if "LODE_TOOLCHAIN" in source:
+                env["LODE_TOOLCHAIN"] = source["LODE_TOOLCHAIN"]
         result.append(Service(name, [definition.command], env, f"http://127.0.0.1:{port}{definition.health_path}",
                               token=source.get(definition.token) if definition.token else None))
     return result
