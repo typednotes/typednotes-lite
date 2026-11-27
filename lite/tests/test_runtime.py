@@ -46,6 +46,17 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(definitions["liaison"].env["SECRETS_PASSWORD"], source["LIAISON_SECRETS_PASSWORD"])
         self.assertEqual(definitions["ledger"].env["PORT"], "8081")
 
+    def test_lode_uses_compiled_defaults_or_bundle_pins(self):
+        source = configuration()
+        lode = next(service for service in runtime.services(source) if service.name == "lode")
+        self.assertNotIn("LODE_LINEN_REV", lode.env)
+        self.assertNotIn("LODE_TOOLCHAIN", lode.env)
+
+        pinned = source | {"LODE_LINEN_REF": "a" * 40, "LODE_TOOLCHAIN": "leanprover/lean4:v4.36.0"}
+        lode = next(service for service in runtime.services(pinned) if service.name == "lode")
+        self.assertEqual(lode.env["LODE_LINEN_REV"], pinned["LODE_LINEN_REF"])
+        self.assertEqual(lode.env["LODE_TOOLCHAIN"], pinned["LODE_TOOLCHAIN"])
+
     def test_vault_uses_only_its_separate_database(self):
         source = configuration()
         definitions = {service.name: service for service in runtime.services(source)}
